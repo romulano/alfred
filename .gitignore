@@ -1,0 +1,6 @@
+alfred.conf
+alfred.log
+alfred.pid
+__pycache__/
+progresso.json
+alfred.conf.bak*

@@ -1,0 +1,14 @@
+[Unit]
+Description=Firewall: a rede Docker ia_local só aceita conexão vinda de dentro dela
+Wants=network-online.target
+After=network-online.target docker.service
+# se o Docker reiniciar, as regras são reaplicadas junto
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/ia-local-isolamento.sh
+
+[Install]
+WantedBy=multi-user.target docker.service

@@ -1,0 +1,56 @@
+# alfred no servidor: só na rede `ia_local`, sem porta publicada.
+#
+#   Quem fala com ele: containers ligados à rede ia_local, em http://alfred:8765
+#   Quem NÃO fala:     a internet, o próprio host (pelo IP da máquina ou da
+#                      bridge) e containers de outras redes. Isso é garantido pelo
+#                      firewall de /usr/local/sbin/ia-local-isolamento.sh.
+#
+# Segredos ficam no .env (permissão 600, fora do git): ALFRED_TOKEN e a
+# autenticação do Claude Code.
+name: alfred
+
+services:
+  alfred:
+    build: .
+    image: alfred:local
+    container_name: alfred
+    hostname: alfred
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    environment:
+      ALFRED_MODELO: sonnet
+      ALFRED_ESFORCO: ""
+      ALFRED_PARALELAS: "2"
+      ALFRED_QUADROS_VIDEO: "8"
+      ALFRED_MAX_CORPO_MB: "64"
+      ALFRED_JOB_TETO: "3600"
+    # Nada de "ports:": nenhuma porta do host aponta para cá.
+    networks:
+      - ia_local
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+      - /home/alfred:size=128m,uid=10001,gid=10001,mode=0700
+    volumes:
+      - dados:/data
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    mem_limit: 3g
+    healthcheck:
+      # 127.0.0.1 é o loopback DO CONTAINER: não depende de rota pelo host.
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/healthz', timeout=20)"]
+      interval: 60s
+      timeout: 25s
+      start_period: 20s
+      retries: 3
+
+networks:
+  ia_local:
+    external: true
+
+volumes:
+  dados:
