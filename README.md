@@ -92,47 +92,6 @@ Argumentos extras vão direto ao `alfred.py`: `./iniciar.sh -e high`.
 
 Testes (com um `claude` falso, sem gastar IA): `python3 teste_alfred.py`.
 
-## No Treino IA
-
-O app (`~/job/exercicio`) tem o provedor **“Claude Code da máquina (ponte
-alfred)”** na tela IA: endereço `http://172.31.87.1:8765`, o token (o mesmo
-`ALFRED_TOKEN`, que também vai no `.env` do app como `PONTE_TOKEN`), modelo e
-esforço. O botão “Usar a ponte em todas as tarefas” liga tudo nela. Só texto
-passa pela ponte: identificar equipamento por foto ainda pede o Claude (API).
-
-## No Tifon
-
-O agregador de ameaças (`/run/media/ubuntu/externo/backup/quimerinha`) tem o
-driver de IA **alfred** em `/admin/config`: endereço `http://172.31.88.1:8765`
-(o gateway da rede Docker do Tifon, já no `ALFRED_ADDR`), modelo e esforço. O
-token é o mesmo `ALFRED_TOKEN`, no `.env` do Tifon com o mesmo nome. A tela
-mostra se a ponte está no ar e se o token foi aceito sem gastar chamada.
-
-## Num servidor
-
-Lá ele roda em container, só na rede Docker `ia_local`, sem porta publicada:
-
-```bash
-SERVIDOR=root@host deploy/publicar.sh   # copia, cria a rede e o firewall, builda e sobe (repetível)
-SERVIDOR=root@host deploy/validar.sh    # responde? está isolado? (sai ≠ 0 se algo falhar)
-```
-
-- **Quem fala com ele:** containers da rede `ia_local`, em `http://alfred:8765`,
-  com `Authorization: Bearer <ALFRED_TOKEN>` (o token está em `/opt/alfred/.env`,
-  permissão 600). Para um app entrar na rede: `networks: [ia_local]` no serviço e
-  `ia_local: {external: true}` em `networks:` do compose dele.
-- **Quem não fala:** a internet, o próprio host (por qualquer IP: público, da
-  bridge, loopback) e containers de outras redes. Quem garante é
-  `/usr/local/sbin/ia-local-isolamento.sh` (`ia-local-isolamento.service`,
-  reaplicado no boot e quando o Docker reinicia): conexão nova só entra na bridge
-  `br-ia_local` vindo dela mesma.
-- A rede não é `internal`: o alfred precisa sair para a API do Claude.
-- O `claude` do container é o binário nativo da extensão do VS Code do servidor
-  (copiado no build). O login vai no `.env` como `CLAUDE_CODE_OAUTH_TOKEN`
-  (gerado com `claude setup-token`); depois, `docker compose up -d` em `/opt/alfred`.
-
----
-
 ## Documentação original
 
 ### alfred — a ponte entre o analista e o CLI do Claude Code

@@ -242,7 +242,7 @@ class ContratoV1(Base):
         self.assertEqual(argv[-2:], ["--disallowed-tools", "Bash,Write"])
 
     def test_tools_por_chamada_so_libera_a_pesquisa_na_web(self):
-        """O Tifon liga a pesquisa na análise do artigo; o texto do artigo é de
+        """Um cliente liga a pesquisa na análise de um artigo; o texto do artigo é de
         terceiros, então o pedido nunca consegue ligar Bash ou arquivo."""
         self.sobe()
         self.post("/v1/chat/completions", {"messages": [{"role": "user", "content": "oi"}],

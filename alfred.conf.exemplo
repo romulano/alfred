@@ -17,9 +17,7 @@ ALFRED_ESFORCO=
 #   127.0.0.1:8765    qualquer programa local
 #   172.31.87.1:8765  a rede Docker do Treino IA (~/job/exercicio). Só existe
 #                     com o app no ar; até lá o alfred espera por ela sozinho.
-#   172.31.88.1:8765  a rede Docker do Tifon (driver de IA `alfred`). Mesma
-#                     coisa: só existe com o Tifon no ar.
-ALFRED_ADDR=127.0.0.1:8765,172.31.87.1:8765,172.31.88.1:8765
+ALFRED_ADDR=127.0.0.1:8765,172.31.87.1:8765
 
 # Chamadas ao claude ao mesmo tempo.
 ALFRED_PARALELAS=2
