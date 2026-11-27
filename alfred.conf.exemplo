@@ -13,11 +13,12 @@ ALFRED_MODELO=sonnet
 # O cliente pode pedir outro por chamada (campo "reasoning_effort").
 ALFRED_ESFORCO=
 
-# Onde escutar, separado por vírgula:
+# Onde escutar, separado por vírgula. O padrão é só esta máquina:
 #   127.0.0.1:8765    qualquer programa local
-#   172.31.87.1:8765  a rede Docker do Treino IA (~/job/exercicio). Só existe
-#                     com o app no ar; até lá o alfred espera por ela sozinho.
-ALFRED_ADDR=127.0.0.1:8765,172.31.87.1:8765
+# Para servir um app em Docker, some o gateway da rede dele, por exemplo
+#   ALFRED_ADDR=127.0.0.1:8765,172.31.87.1:8765
+# (o alfred espera sozinho o endereço existir) — e configure o ALFRED_TOKEN.
+ALFRED_ADDR=127.0.0.1:8765
 
 # Chamadas ao claude ao mesmo tempo.
 ALFRED_PARALELAS=2
@@ -43,3 +44,13 @@ ALFRED_MAX_CORPO_MB=64
 
 # Quanto um pedido longo (que virou ticket) pode rodar, em segundos (padrão 1800).
 ALFRED_JOB_TETO=1800
+
+# Ollama: o modelo "ollama:<nome>" (ex.: ollama:qwen3-coder:30b) vai direto à
+# API dele, sem abrir processo. Vazio = http://127.0.0.1:11434.
+ALFRED_OLLAMA=
+
+# Histórico: toda pergunta e resposta fica num SQLite só seu (permissão 600).
+# Vazio = ~/.local/share/alfred/alfred.db. ALFRED_HISTORICO=0 desliga.
+# Para levar tudo embora: ./iniciar.sh exportar historico.json
+ALFRED_DB=
+ALFRED_HISTORICO=1
