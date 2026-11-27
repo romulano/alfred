@@ -43,6 +43,8 @@ import argparse
 import base64
 import binascii
 import errno
+import hmac
+import http.client
 import json
 import os
 import re
@@ -50,15 +52,17 @@ import select
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSAO = "1.1"
+VERSAO = "1.2"
 
 # O corpo de uma requisição do analista é grande — o contexto do mundo somado
 # aos achados chega a dezenas de KB — mas não é ilimitado: o `max_prompt_chars`
@@ -93,6 +97,11 @@ ESFORCOS = ("low", "medium", "high", "xhigh", "max")
 # pesquisa na web: o prompt costuma levar texto de terceiros (um artigo
 # coletado), e uma injeção nele nunca pode ganhar Bash ou acesso a arquivo.
 FERRAMENTAS_POR_CHAMADA = ("WebSearch", "WebFetch")
+# Os modos de permissão que um cliente pode pedir por chamada. Os outros
+# (`acceptEdits`, `bypassPermissions`, `auto`…) só o operador liga, por
+# `--permissao`: vindos do pedido, um prompt com texto de terceiros ganharia a
+# máquina. `disallowed_tools` também só TIRA ferramenta — nunca liga as outras.
+PERMISSOES_POR_CHAMADA = ("plan", "default")
 
 # Codex (OpenAI). O modelo escolhe o provedor: `gpt-…`, `codex-…` ou o prefixo
 # `codex:`/`openai:` vão para `codex exec`; o resto (opus, sonnet, claude-…)
@@ -126,6 +135,22 @@ def modelo_codex(modelo):
     return m if RE_MODELO_CODEX.match(m) else ""
 
 
+# Ollama: `ollama:<nome>` ("ollama:qwen3-coder:30b", "ollama:hf.co/x/y") vai
+# direto à API HTTP do Ollama — sem processo para abrir, sem ferramenta nenhuma
+# para desligar (ele só gera texto).
+PREFIXO_OLLAMA = "ollama:"
+RE_MODELO_OLLAMA = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
+
+
+def modelo_ollama(modelo):
+    """O nome do modelo no Ollama se `modelo` for `ollama:<nome>`, senão ""."""
+    bruto = (modelo or "").strip()
+    if not bruto.lower().startswith(PREFIXO_OLLAMA):
+        return ""
+    nome = bruto[len(PREFIXO_OLLAMA):].strip()
+    return nome if RE_MODELO_OLLAMA.match(nome) else ""
+
+
 def codex_padrao():
     """`codex` do PATH; senão o que o app do Codex instala em ~/.codex."""
     achado = shutil.which("codex")
@@ -154,6 +179,11 @@ class Resultado:
         self.turnos = 0
         self.sessao = ""
         self.modelo = ""
+        self.provedor = ""
+        self.esforco = ""
+        # preenchidos por quem submeteu: a linha do histórico e a conversa
+        self.chamada_id = ""
+        self.conversa_id = ""
         self.tokens_in = 0
         self.tokens_out = 0
         self.limite_turnos = False
@@ -289,6 +319,221 @@ class Trabalho:
         return int((fim - self.criado) * 1000)
 
 
+# ------------------------------------------------------------------ memória
+
+# Tudo o que o alfred fez nesta máquina, para este usuário, num SQLite local.
+# Nada sai daqui: o arquivo é do dono (0600, pasta 0700), e exportar é uma
+# decisão dele (`./iniciar.sh exportar`). Duas tabelas de trabalho:
+#
+#   chamadas   uma linha por pergunta: quem pediu, a que modelo, o que entrou
+#              (sem os bytes de foto e vídeo), o que saiu, custo, tokens, tempo
+#   mensagens  as conversas com `conversa_id`, que o alfred devolve ao modelo
+#              na pergunta seguinte — o cliente manda só a mensagem nova
+ESQUEMA = """
+CREATE TABLE IF NOT EXISTS conversas (
+    id TEXT PRIMARY KEY,
+    titulo TEXT NOT NULL DEFAULT '',
+    criada REAL NOT NULL,
+    atualizada REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mensagens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversa_id TEXT NOT NULL,
+    chamada_id TEXT,
+    papel TEXT NOT NULL,
+    conteudo TEXT NOT NULL,
+    criada REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS mensagens_conversa ON mensagens(conversa_id, id);
+CREATE TABLE IF NOT EXISTS chamadas (
+    id TEXT PRIMARY KEY,
+    criada REAL NOT NULL,
+    rota TEXT,
+    cliente TEXT,
+    conversa_id TEXT,
+    provedor TEXT,
+    modelo TEXT,
+    esforco TEXT,
+    sistema TEXT,
+    entrada TEXT,
+    midia TEXT,
+    ok INTEGER,
+    resposta TEXT,
+    erro TEXT,
+    custo_usd REAL,
+    tokens_in INTEGER,
+    tokens_out INTEGER,
+    dur_ms INTEGER,
+    ticket INTEGER
+);
+CREATE INDEX IF NOT EXISTS chamadas_criada ON chamadas(criada);
+CREATE INDEX IF NOT EXISTS chamadas_conversa ON chamadas(conversa_id);
+"""
+RE_CONVERSA = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def caminho_db_padrao():
+    base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(base, "alfred", "alfred.db")
+
+
+class Memoria:
+    """O histórico local. Uma conexão só, protegida por lock: as escritas são
+    poucas (uma por pergunta) e o SQLite em WAL deixa ler enquanto escreve."""
+
+    def __init__(self, caminho):
+        self.caminho = caminho
+        self.lock = threading.Lock()
+        pasta = os.path.dirname(os.path.abspath(caminho))
+        os.makedirs(pasta, mode=0o700, exist_ok=True)
+        # Criado 0600 ANTES de o sqlite abrir: o histórico guarda prompts, e
+        # prompt do analista costuma trazer senha de conta de teste. Os arquivos
+        # -wal e -shm herdam a permissão deste.
+        os.close(os.open(caminho, os.O_CREAT | os.O_RDWR, 0o600))
+        os.chmod(caminho, 0o600)
+        self.db = sqlite3.connect(caminho, check_same_thread=False, isolation_level=None, timeout=10)
+        self.db.row_factory = sqlite3.Row
+        with self.lock:
+            self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.executescript(ESQUEMA)
+            self.db.execute("PRAGMA user_version=1")
+
+    def fechar(self):
+        with self.lock:
+            self.db.close()
+
+    def historico(self, conversa_id):
+        """As mensagens já trocadas na conversa, no formato OpenAI."""
+        with self.lock:
+            linhas = self.db.execute(
+                "SELECT papel, conteudo FROM mensagens WHERE conversa_id=? ORDER BY id",
+                (conversa_id,)).fetchall()
+        return [{"role": l["papel"], "content": l["conteudo"]} for l in linhas]
+
+    def gravar(self, reg, r, ticket=False):
+        """Uma pergunta que terminou: a linha de `chamadas` sempre; a conversa
+        só cresce quando deu certo (falha não entra no histórico, senão a
+        próxima pergunta levaria ao modelo uma pergunta sem resposta)."""
+        agora = time.time()
+        cid = reg.get("conversa_id") or ""
+        with self.lock:
+            self.db.execute("BEGIN")
+            try:
+                self.db.execute(
+                    "INSERT OR REPLACE INTO chamadas (id, criada, rota, cliente, conversa_id, provedor,"
+                    " modelo, esforco, sistema, entrada, midia, ok, resposta, erro, custo_usd,"
+                    " tokens_in, tokens_out, dur_ms, ticket)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (r.chamada_id, reg.get("criada") or agora, reg.get("rota"), reg.get("cliente"),
+                     cid or None, r.provedor, r.modelo, r.esforco, reg.get("sistema") or "",
+                     reg.get("entrada") or "", json.dumps(reg.get("midia")) if reg.get("midia") else None,
+                     1 if r.ok else 0, r.texto, r.erro, r.custo, r.tokens_in, r.tokens_out,
+                     r.dur_ms, 1 if ticket else 0))
+                if cid and r.ok:
+                    novas = [(p, t) for p, t in reg.get("novas") or [] if t.strip()]
+                    titulo = next((t for p, t in novas if p == "user"), "")[:80]
+                    self.db.execute(
+                        "INSERT INTO conversas (id, titulo, criada, atualizada) VALUES (?,?,?,?)"
+                        " ON CONFLICT(id) DO UPDATE SET atualizada=excluded.atualizada,"
+                        " titulo=CASE WHEN conversas.titulo='' THEN excluded.titulo ELSE conversas.titulo END",
+                        (cid, " ".join(titulo.split()), agora, agora))
+                    for papel, texto in [*novas, ("assistant", r.texto)]:
+                        self.db.execute(
+                            "INSERT INTO mensagens (conversa_id, chamada_id, papel, conteudo, criada)"
+                            " VALUES (?,?,?,?,?)", (cid, r.chamada_id, papel, texto, agora))
+                self.db.execute("COMMIT")
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
+
+    def conversas(self, limite=50):
+        with self.lock:
+            linhas = self.db.execute(
+                "SELECT c.id, c.titulo, c.criada, c.atualizada,"
+                " (SELECT COUNT(*) FROM mensagens m WHERE m.conversa_id=c.id) AS mensagens"
+                " FROM conversas c ORDER BY c.atualizada DESC LIMIT ?", (limite,)).fetchall()
+        return [dict(l) for l in linhas]
+
+    def conversa(self, conversa_id):
+        with self.lock:
+            c = self.db.execute("SELECT * FROM conversas WHERE id=?", (conversa_id,)).fetchone()
+            if c is None:
+                return None
+            msgs = self.db.execute(
+                "SELECT papel, conteudo, criada, chamada_id FROM mensagens WHERE conversa_id=? ORDER BY id",
+                (conversa_id,)).fetchall()
+        return {**dict(c), "mensagens": [dict(m) for m in msgs]}
+
+    def apagar_conversa(self, conversa_id):
+        """Some com a conversa e com as chamadas dela (o que entrou e saiu)."""
+        with self.lock:
+            self.db.execute("BEGIN")
+            try:
+                n = self.db.execute("DELETE FROM conversas WHERE id=?", (conversa_id,)).rowcount
+                self.db.execute("DELETE FROM mensagens WHERE conversa_id=?", (conversa_id,))
+                self.db.execute("DELETE FROM chamadas WHERE conversa_id=?", (conversa_id,))
+                self.db.execute("COMMIT")
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
+        return n > 0
+
+    def chamadas(self, limite=50, conversa_id=""):
+        sql, args = "SELECT * FROM chamadas", []
+        if conversa_id:
+            sql, args = sql + " WHERE conversa_id=?", [conversa_id]
+        with self.lock:
+            linhas = self.db.execute(sql + " ORDER BY criada DESC LIMIT ?", (*args, limite)).fetchall()
+        return [self._chamada(l) for l in linhas]
+
+    @staticmethod
+    def _chamada(l):
+        d = dict(l)
+        d["ok"] = bool(d["ok"])
+        d["ticket"] = bool(d["ticket"])
+        d["midia"] = json.loads(d["midia"]) if d["midia"] else None
+        return d
+
+    def resumo(self):
+        with self.lock:
+            c = self.db.execute("SELECT COUNT(*), COALESCE(SUM(custo_usd),0) FROM chamadas").fetchone()
+            n = self.db.execute("SELECT COUNT(*) FROM conversas").fetchone()[0]
+        return {"chamadas": c[0], "conversas": n, "custo_usd": round(c[1], 6)}
+
+    def exportar(self):
+        """Tudo, num documento só: é o que o dono leva para outra máquina."""
+        with self.lock:
+            conversas = [dict(c) for c in self.db.execute("SELECT * FROM conversas ORDER BY criada")]
+            msgs = self.db.execute(
+                "SELECT conversa_id, papel, conteudo, criada, chamada_id FROM mensagens ORDER BY id").fetchall()
+            chamadas = [self._chamada(l) for l in self.db.execute("SELECT * FROM chamadas ORDER BY criada")]
+        por_conversa = {}
+        for m in msgs:
+            d = dict(m)
+            por_conversa.setdefault(d.pop("conversa_id"), []).append(d)
+        for c in conversas:
+            c["mensagens"] = por_conversa.get(c["id"], [])
+        return {"formato": "alfred-historico", "versao": 1, "alfred": VERSAO,
+                "exportado_em": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "conversas": conversas, "chamadas": chamadas}
+
+
+def sem_midia(msgs):
+    """As mensagens como o histórico as guarda: o texto inteiro, e no lugar de
+    cada foto ou vídeo só o tipo — os bytes encheriam o banco sem servir para
+    reler a conversa."""
+    saida = []
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        c = m.get("content")
+        if isinstance(c, list):
+            c = [b if not isinstance(b, dict) or b.get("type") in ("text", "input_text")
+                 else {"type": b.get("type"), "omitido": True} for b in c]
+        saida.append({"role": str(m.get("role") or "user"), "content": c})
+    return saida
+
+
 class Ponte:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -320,6 +565,9 @@ class Ponte:
                 self.medias = json.load(f)
         except (OSError, ValueError):
             self.medias = {}
+        # O histórico local (None = desligado com --sem-historico)
+        self.memoria = None if getattr(cfg, "sem_historico", False) or not getattr(cfg, "db", "") \
+            else Memoria(cfg.db)
 
     def media(self, chave):
         with self.medias_lock:
@@ -350,6 +598,9 @@ class Ponte:
     def fechar(self):
         if self.dir_proprio:
             shutil.rmtree(self.dir, ignore_errors=True)
+        if self.memoria is not None:
+            self.memoria.fechar()
+            self.memoria = None
 
     def versao_claude(self):
         return self.versao_de(self.cfg.claude)
@@ -419,14 +670,17 @@ class Ponte:
         # primeira tentativa de medir o CLI aqui perdeu o prompt — ele virou item
         # da lista de ferramentas proibidas e o `claude` respondeu "input must be
         # provided". Como o prompt vem pelo stdin, não há posicional para engolir.
+        #
+        # `--tools` vai SEMPRE. Sem ele o CLI liga todas as ferramentas, e era
+        # isso que acontecia quando o pedido trazia `disallowed_tools`: a lista
+        # de proibidas trocava a de liberadas, e Bash, Read e Write subiam
+        # junto. As proibidas agora só tiram da lista liberada. Vazia (o padrão)
+        # = nenhuma ferramenta: o analista quer julgamento sobre o JSON que está
+        # no prompt, não uma investigação por conta própria.
+        liberadas = [f for f in (ferramentas or "").split(",") if f.strip() and f.strip() not in negadas]
+        a += ["--tools", ",".join(liberadas)]
         if negadas:
             a += ["--disallowed-tools", ",".join(negadas)]
-        elif ferramentas:
-            a += ["--tools", ferramentas]
-        else:
-            # Nenhuma ferramenta: o analista quer julgamento sobre o JSON que
-            # está no prompt, não uma investigação por conta própria.
-            a += ["--tools", ""]
         return a
 
     def argv_codex(self, instrucoes_arq, modelo, esforco, web=False, imagens=()):
@@ -459,6 +713,7 @@ class Ponte:
         pediu o ticket —, e o vigia passa a responder "vivo" para sempre.
         """
         t = Trabalho(uuid.uuid4().hex[:16], rota)
+        reg = kw.pop("registro", None)
         rotulo = kw.pop("progresso_rotulo", "")
         if rotulo:
             modelo = (kw.get("modelo") or "").strip().lower()
@@ -479,6 +734,16 @@ class Ponte:
                 t.r = r
             finally:
                 t.fim = time.time()
+                t.r.chamada_id = t.id
+                t.r.conversa_id = (reg or {}).get("conversa_id") or ""
+                # Grava ANTES de soltar a resposta: o cliente que recebe e já
+                # manda a próxima mensagem da conversa tem de achar esta no banco.
+                memoria = self.memoria
+                if memoria is not None and reg and reg.get("gravar", True):
+                    try:
+                        memoria.gravar(reg, t.r, ticket=t.promovido)
+                    except Exception as e:  # noqa: BLE001 — histórico não derruba a resposta
+                        log(f"não consegui gravar a chamada {t.id} no histórico: {e}")
                 t.pronto.set()
                 # Quem já virou ticket não tem mais handler esperando por ele:
                 # sem esta linha, a trilha perderia o custo e a duração
@@ -627,19 +892,29 @@ class Ponte:
         timeout = min(timeout or cfg.timeout, max(cfg.timeout_max, cfg.job_teto))
         if modelo.strip().lower() in MODELOS_GENERICOS:
             modelo = cfg.modelo
-        # GPT-… vai para o Codex; o resto continua no Claude Code
-        codex = modelo_codex(modelo)
-        if codex:
+        # ollama:… vai ao Ollama; GPT-… vai para o Codex; o resto fica no Claude Code
+        ollama = modelo_ollama(modelo)
+        if modelo.strip().lower().startswith(PREFIXO_OLLAMA) and not ollama:
+            r = Resultado()
+            r.erro = f"nome de modelo do Ollama inválido: {modelo!r}"
+            return r
+        codex = "" if ollama else modelo_codex(modelo)
+        if ollama:
+            modelo = ollama
+        elif codex:
             modelo = codex
         esforco = (esforco or cfg.esforco or "").strip()
         validos = ESFORCOS_CODEX if codex else ESFORCOS
-        if esforco and esforco not in validos:
+        # O Ollama não tem nível de esforço: o do servidor (ou do pedido) é ignorado
+        if esforco and not ollama and esforco not in validos:
             r = Resultado()
             r.erro = f"esforço {esforco!r} não existe (use: {', '.join(validos)})"
             return r
 
         r = Resultado()
         r.modelo = modelo or "(padrão do CLI)"
+        r.provedor = "ollama" if ollama else ("codex" if codex else "claude")
+        r.esforco = "" if ollama else esforco
 
         # `timeout` é o prazo da CHAMADA INTEIRA, fila inclusive. Gastá-lo duas
         # vezes — uma esperando vaga, outra rodando o processo — era o defeito
@@ -667,6 +942,10 @@ class Ponte:
         sistema_arq = ""
         imagens = []
         try:
+            if ollama:
+                self.chamar_ollama(r, modelo, sistema, prompt, blocos, restante, vivo)
+                r.dur_ms = int((time.time() - t0) * 1000)
+                return r
             if sistema.strip():
                 fd, sistema_arq = tempfile.mkstemp(prefix="sistema-", suffix=".txt", dir=self.dir)
                 with os.fdopen(fd, "w") as f:  # mkstemp já cria 0600
@@ -721,6 +1000,110 @@ class Ponte:
                     self.falhas += 1
             self.vaga.release()
         return r
+
+    # ------------------------------------------------------------- ollama
+
+    def _ollama(self, metodo, caminho, corpo=None, timeout=2.0):
+        """(HTTPConnection, pedido) para o Ollama em --ollama. Sem rede além do
+        endereço que o operador configurou: o pedido nunca escolhe o host."""
+        u = urllib.parse.urlsplit(self.cfg.ollama)
+        classe = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+        conn = classe(u.hostname or "127.0.0.1", u.port or (443 if u.scheme == "https" else 11434),
+                      timeout=timeout)
+        conn.request(metodo, u.path.rstrip("/") + caminho, body=corpo,
+                     headers={"Content-Type": "application/json"} if corpo is not None else {})
+        return conn
+
+    def ollama_get(self, caminho, timeout=1.5):
+        """GET rápido (versão, modelos). None se o Ollama não responder."""
+        try:
+            conn = self._ollama("GET", caminho, timeout=timeout)
+            try:
+                resp = conn.getresponse()
+                return json.loads(resp.read()) if resp.status == 200 else None
+            finally:
+                conn.close()
+        except (OSError, ValueError, http.client.HTTPException):
+            return None
+
+    def versao_ollama(self):
+        d = self.ollama_get("/api/version")
+        return str(d.get("version")) if isinstance(d, dict) and d.get("version") else "indisponível"
+
+    def modelos_ollama(self):
+        d = self.ollama_get("/api/tags")
+        modelos = d.get("models") if isinstance(d, dict) else None
+        return [str(m.get("name")) for m in modelos or [] if isinstance(m, dict) and m.get("name")]
+
+    def chamar_ollama(self, r, modelo, sistema, prompt, blocos, timeout, vivo):
+        """Uma pergunta ao /api/chat do Ollama, com o mesmo contrato do claude:
+        prazo, e o cliente sumir encerra a geração (fechar a conexão faz o
+        Ollama parar de gerar)."""
+        msgs = [{"role": "system", "content": sistema}] if sistema.strip() else []
+        usuario = {"role": "user", "content": prompt}
+        if blocos:
+            usuario["content"] = "\n\n".join(b["text"] for b in blocos if b.get("type") == "text")
+            imagens = [b["source"]["data"] for b in blocos if b.get("type") == "image"]
+            if imagens:
+                usuario["images"] = imagens
+        msgs.append(usuario)
+        corpo = json.dumps({"model": modelo, "messages": msgs, "stream": False}).encode()
+
+        caixa, conns = {}, []
+
+        def pedir():
+            try:
+                conn = self._ollama("POST", "/api/chat", corpo, timeout=timeout)
+                conns.append(conn)
+                resp = conn.getresponse()
+                caixa["codigo"], caixa["corpo"] = resp.status, resp.read()
+            except Exception as e:  # noqa: BLE001 — vira erro legível abaixo
+                caixa["erro"] = e
+
+        th = threading.Thread(target=pedir, daemon=True)
+        th.start()
+        fim = time.time() + timeout
+        morto = ""
+        while th.is_alive():
+            th.join(0.5)
+            if not th.is_alive():
+                break
+            if vivo is not None and not vivo():
+                morto = "o cliente desistiu da chamada antes da resposta"
+            elif time.time() > fim:
+                morto = f"a chamada passou de {timeout:.0f}s e foi encerrada"
+            if morto:
+                for c in conns:
+                    try:
+                        c.sock and c.sock.shutdown(socket.SHUT_RDWR)
+                        c.close()
+                    except OSError:
+                        pass
+                r.erro = morto
+                return
+        for c in conns:
+            c.close()
+        if "erro" in caixa:
+            e = caixa["erro"]
+            r.erro = (f"o Ollama não responde em {self.cfg.ollama} — ele está rodando? (ollama serve)"
+                      if isinstance(e, (ConnectionRefusedError, socket.gaierror)) else
+                      f"Ollama: {type(e).__name__}: {e}")
+            return
+        try:
+            doc = json.loads(caixa.get("corpo") or b"{}")
+        except ValueError:
+            doc = {}
+        if caixa.get("codigo") != 200:
+            r.erro = f"Ollama ({caixa.get('codigo')}): {doc.get('error') or 'resposta sem explicação'}"
+            return
+        r.tokens_in = int(doc.get("prompt_eval_count") or 0)
+        r.tokens_out = int(doc.get("eval_count") or 0)
+        r.turnos = 1
+        texto = (doc.get("message") or {}).get("content")
+        if not isinstance(texto, str) or not texto.strip():
+            r.erro = "o Ollama respondeu sem texto nenhum"
+            return
+        r.ok, r.texto = True, texto
 
     # Prazo mínimo de processo: abaixo disto o `claude` nem termina de subir, e
     # gastar a vaga para estourar em seguida é pior que recusar na hora.
@@ -1016,7 +1399,7 @@ class Handler(BaseHTTPRequestHandler):
             return True
         dado = (self.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
         dado = dado or (self.headers.get("X-Token") or "").strip()
-        if dado == self.cfg.token:
+        if hmac.compare_digest(dado.encode(), self.cfg.token.encode()):
             return True
         self.erro(401, "token ausente ou errado", tipo="authentication_error")
         return False
@@ -1040,11 +1423,13 @@ class Handler(BaseHTTPRequestHandler):
         rota = self.path.split("?", 1)[0].rstrip("/") or "/"
         if rota in ("/healthz", "/health", "/"):
             p = self.ponte
-            claude, codex = p.versao_claude(), p.versao_codex()
+            claude, codex, ollama = p.versao_claude(), p.versao_codex(), p.versao_ollama()
+            historico = p.memoria.resumo() if p.memoria is not None else None
             with p.lock:
                 self.responder(200, {
                     "ok": True, "servico": "alfred", "versao": VERSAO,
-                    "claude": claude, "codex": codex, "modelo": self.cfg.modelo or "(padrão do CLI)",
+                    "claude": claude, "codex": codex, "ollama": ollama,
+                    "historico": historico, "modelo": self.cfg.modelo or "(padrão do CLI)",
                     "esforco": self.cfg.esforco or "(padrão do CLI)",
                     "em_voo": p.em_voo, "paralelas": self.cfg.paralelas,
                     "chamadas": p.chamadas, "falhas": p.falhas,
@@ -1060,19 +1445,26 @@ class Handler(BaseHTTPRequestHandler):
                 {"id": m, "object": "model", "created": agora, "owned_by": "alfred"}
                 for m in ("claude-code", "opus", "sonnet", "haiku")
             ] + [{"id": m, "object": "model", "created": agora, "owned_by": "codex"}
-                 for m in self.ponte.modelos_codex()]})
+                 for m in self.ponte.modelos_codex()]
+              + [{"id": PREFIXO_OLLAMA + m, "object": "model", "created": agora, "owned_by": "ollama"}
+                 for m in self.ponte.modelos_ollama()]})
             return
         if rota.startswith("/jobs/") or rota.startswith("/v1/jobs/"):
             self.job(rota.rsplit("/", 1)[-1])
             return
-        self.erro(404, f"rota {rota} não existe (tente /v1/chat/completions, /run, /jobs/<id>, /healthz)")
+        if self.rotas_historico("GET", rota, urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)):
+            return
+        self.erro(404, f"rota {rota} não existe (tente /v1/chat/completions, /run, /jobs/<id>, "
+                       "/v1/conversas, /v1/historico, /v1/exportar, /healthz)")
 
     def do_DELETE(self):
         if not self.autorizado():
             return
         rota = self.path.split("?", 1)[0].rstrip("/") or "/"
+        if self.rotas_historico("DELETE", rota, {}):
+            return
         if not (rota.startswith("/jobs/") or rota.startswith("/v1/jobs/")):
-            self.erro(404, f"rota {rota} não existe (tente DELETE /jobs/<id>)")
+            self.erro(404, f"rota {rota} não existe (tente DELETE /jobs/<id> ou /v1/conversas/<id>)")
             return
         t = self.ponte.buscar_job(rota.rsplit("/", 1)[-1])
         if t is None:
@@ -1105,9 +1497,15 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(msgs, list) or not msgs:
             self.erro(400, "faltou `messages`")
             return
-        sistema, prompt = separar(msgs)
+        cid, ok = self.conversa_de(req)
+        if not ok:
+            return
+        # Com conversa, o cliente manda só a mensagem nova: o que já foi dito
+        # vem do histórico, antes dela.
+        antigas = self.ponte.memoria.historico(cid) if cid else []
+        sistema, prompt = separar(antigas + msgs)
         try:
-            midia = separar_midia(msgs)
+            midia = separar_midia(antigas + msgs)
             blocos, info = (self.ponte.preparar_midia(midia, int(req.get("video_quadros") or 0))
                             if midia else (None, None))
         except ErroMidia as e:
@@ -1130,7 +1528,13 @@ class Handler(BaseHTTPRequestHandler):
                        ferramentas=ferramentas_de(req),
                        permissao=str(req.get("permission_mode") or ""),
                        esforco=esforco_de(req), blocos=blocos,
-                       progresso_rotulo=str(req.get("progresso_rotulo") or "")[:40])
+                       progresso_rotulo=str(req.get("progresso_rotulo") or "")[:40],
+                       registro=self.registro(
+                           "/v1/chat/completions", req, cid, separar(msgs)[0],
+                           json.dumps(sem_midia(msgs), ensure_ascii=False),
+                           [(str(m.get("role") or "user"), texto_de(m.get("content")))
+                            for m in msgs if isinstance(m, dict) and m.get("role") != "system"],
+                           info))
 
     # O caminho legado (backend `alfred-run`): {"ok":…, "result":…}, com o erro
     # em `raw.stderr` porque é ali que o config do analista o procura.
@@ -1142,8 +1546,14 @@ class Handler(BaseHTTPRequestHandler):
         if not prompt.strip():
             self.erro(400, "faltou `prompt`")
             return
+        cid, ok = self.conversa_de(req)
+        if not ok:
+            return
+        novo = prompt
+        if cid:
+            _, prompt = separar(self.ponte.memoria.historico(cid) + [{"role": "user", "content": novo}])
         # Fotos e vídeos como data URL (ou {"mime","base64"}) em "imagens" e "videos"
-        blocos = None
+        blocos, info = None, None
         try:
             partes = [("imagem", *midia_de(x)) for x in lista_bruta(req.get("imagens"))]
             partes += [("video", *midia_de(x)) for x in lista_bruta(req.get("videos"))]
@@ -1154,14 +1564,93 @@ class Handler(BaseHTTPRequestHandler):
         except ErroMidia as e:
             self.erro(400, str(e))
             return
-        self.despachar("/run", req,
-                       texto_de(req.get("system") or req.get("sistema") or ""), prompt,
+        sistema = texto_de(req.get("system") or req.get("sistema") or "")
+        self.despachar("/run", req, sistema, prompt,
                        modelo=str(req.get("model") or ""),
                        permissao=str(req.get("permission_mode") or ""),
                        turnos=int(req.get("max_turns") or 0),
                        negadas=lista(req.get("disallowed_tools")),
                        timeout=int(req.get("timeout_seconds") or 0),
-                       esforco=esforco_de(req), blocos=blocos)
+                       esforco=esforco_de(req), blocos=blocos,
+                       registro=self.registro("/run", req, cid, sistema, novo, [("user", novo)], info))
+
+    # ------------------------------------------------------------- memória
+
+    def conversa_de(self, req):
+        """(conversa_id, ok). `"nova"` pede ao alfred que invente um id; sem o
+        campo, a pergunta é avulsa (como sempre foi), mas entra no histórico."""
+        v = req.get("conversa_id") or req.get("conversation_id")
+        if v is None or v == "":
+            return "", True
+        v = str(v).strip()
+        if v == "nova":
+            v = uuid.uuid4().hex[:16]
+        if not RE_CONVERSA.match(v):
+            self.erro(400, "conversa_id inválido: até 64 caracteres entre letras, números, ponto, hífen e _")
+            return "", False
+        if self.ponte.memoria is None:
+            self.erro(400, "conversa_id precisa do histórico, e este alfred subiu com --sem-historico")
+            return "", False
+        return v, True
+
+    def registro(self, rota, req, cid, sistema, entrada, novas, midia):
+        """O que a thread da chamada grava no histórico quando ela terminar."""
+        return {"rota": rota, "cliente": self.client_address[0], "conversa_id": cid,
+                "sistema": sistema, "entrada": entrada, "novas": novas, "midia": midia,
+                "criada": time.time(), "gravar": req.get("historico", True) is not False}
+
+    def historico_liberado(self):
+        """Ler ou apagar o histórico: com token, quem tem o token; sem token,
+        só esta máquina (127.0.0.1). Sem esta regra, qualquer container da rede
+        Docker em que o alfred escuta leria todas as conversas do dono."""
+        if self.cfg.token:
+            return self.autorizado()
+        if self.client_address[0] in ("127.0.0.1", "::1"):
+            return True
+        self.erro(403, "o histórico só abre a partir desta máquina; para ler de fora, configure ALFRED_TOKEN",
+                  tipo="permission_error")
+        return False
+
+    def rotas_historico(self, metodo, rota, consulta):
+        """GET/DELETE de /v1/conversas, /v1/historico e /v1/exportar. True se a
+        rota era daqui (respondida ou recusada)."""
+        if not (rota.startswith("/v1/conversas") or rota in ("/v1/historico", "/v1/exportar")):
+            return False
+        if not self.historico_liberado():
+            return True
+        m = self.ponte.memoria
+        if m is None:
+            self.erro(404, "histórico desligado (--sem-historico)", tipo="not_found")
+            return True
+        try:
+            limite = max(1, min(int((consulta.get("limite") or ["50"])[0]), 1000))
+        except ValueError:
+            limite = 50
+        partes = rota.split("/")  # ['', 'v1', 'conversas', '<id>']
+        ident = partes[3] if len(partes) > 3 else ""
+        if metodo == "DELETE":
+            if rota.startswith("/v1/conversas/") and ident:
+                if m.apagar_conversa(ident):
+                    self.responder(200, {"id": ident, "object": "alfred.conversa", "apagada": True})
+                else:
+                    self.erro(404, f"conversa {ident} não existe", tipo="not_found")
+            else:
+                self.erro(404, f"rota {rota} não existe (tente DELETE /v1/conversas/<id>)")
+            return True
+        if rota == "/v1/conversas":
+            self.responder(200, {"object": "list", "data": m.conversas(limite)})
+        elif ident:
+            c = m.conversa(ident)
+            if c is None:
+                self.erro(404, f"conversa {ident} não existe", tipo="not_found")
+            else:
+                self.responder(200, c)
+        elif rota == "/v1/historico":
+            self.responder(200, {"object": "list",
+                                 "data": m.chamadas(limite, (consulta.get("conversa") or [""])[0])})
+        else:  # /v1/exportar
+            self.responder(200, m.exportar())
+        return True
 
     # ------------------------------------------------------- despacho e ticket
 
@@ -1173,6 +1662,11 @@ class Handler(BaseHTTPRequestHandler):
         receberia um 202 sem `choices` e quebraria em "campo não existe" no meio
         de uma corrida — o modo de falha mais caro que esta ponte tem.
         """
+        permissao = kw.get("permissao") or ""
+        if permissao and permissao not in PERMISSOES_POR_CHAMADA:
+            self.erro(400, f"permission_mode {permissao!r} não pode vir no pedido "
+                           f"(use: {', '.join(PERMISSOES_POR_CHAMADA)}; os outros só por --permissao)")
+            return
         prazo_resposta = min(kw.get("timeout") or self.cfg.timeout, self.cfg.timeout_max)
         agendar = bool(req.get("agendar") or req.get("async"))
         if agendar:
@@ -1217,6 +1711,7 @@ class Handler(BaseHTTPRequestHandler):
                     "raw": {"stdout": r.texto, "stderr": "", "exit_code": r.saida},
                     "session_id": r.sessao, "custo_usd": r.custo,
                     "dur_ms": r.dur_ms, "num_turns": r.turnos,
+                    "chamada_id": r.chamada_id, "conversa_id": r.conversa_id or None,
                 }
             return 200, {
                 "ok": False, "result": "", "erro": r.erro,
@@ -1242,7 +1737,8 @@ class Handler(BaseHTTPRequestHandler):
                 "total_tokens": r.tokens_in + r.tokens_out,
             },
             "alfred": {"dur_ms": r.dur_ms, "custo_usd": r.custo,
-                       "turnos": r.turnos, "sessao": r.sessao},
+                       "turnos": r.turnos, "sessao": r.sessao, "provedor": r.provedor,
+                       "chamada_id": r.chamada_id, "conversa_id": r.conversa_id or None},
         }
 
     @staticmethod
@@ -1507,9 +2003,38 @@ http://127.0.0.1:8765/v1/chat/completions.""")
                    help="quantos quadros tirar de cada vídeo (padrão: 8; o cliente pode pedir com video_quadros)")
     p.add_argument("--max-corpo-mb", type=int, default=int(os.getenv("ALFRED_MAX_CORPO_MB", "64")),
                    help="teto de um pedido, em MB, contando fotos e vídeos em base64 (padrão: 64)")
+    p.add_argument("--ollama", default=os.getenv("ALFRED_OLLAMA") or "http://127.0.0.1:11434",
+                   help="endereço da API do Ollama, para os modelos ollama:<nome> (padrão: http://127.0.0.1:11434)")
+    p.add_argument("--db", default=os.getenv("ALFRED_DB") or caminho_db_padrao(),
+                   help="o SQLite do histórico (padrão: ~/.local/share/alfred/alfred.db)")
+    p.add_argument("--sem-historico", action="store_true",
+                   default=os.getenv("ALFRED_HISTORICO", "1").strip().lower() in ("0", "nao", "não", "false", "off"),
+                   help="não grava nada no histórico (e recusa conversa_id)")
+    p.add_argument("--exportar", metavar="ARQUIVO",
+                   help="escreve o histórico inteiro em JSON (- = saída padrão) e sai, sem subir o servidor")
     p.add_argument("-v", "--verboso", action="store_true", help="loga o argv de cada chamada")
     p.add_argument("-V", "--version", action="version", version=f"alfred {VERSAO}")
     return p.parse_args(argv)
+
+
+def exportar(cfg):
+    """`--exportar`: o histórico inteiro num JSON que é do dono (0600)."""
+    if not os.path.exists(cfg.db):
+        log(f"!! não há histórico em {cfg.db}")
+        return 1
+    m = Memoria(cfg.db)
+    try:
+        doc = json.dumps(m.exportar(), ensure_ascii=False, indent=1)
+    finally:
+        m.fechar()
+    if cfg.exportar == "-":
+        sys.stdout.write(doc + "\n")
+        return 0
+    fd = os.open(cfg.exportar, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(doc + "\n")
+    log(f"histórico exportado para {cfg.exportar}")
+    return 0
 
 
 def enderecos_de(texto):
@@ -1526,9 +2051,15 @@ def enderecos_de(texto):
     return saida
 
 
+class Servidor(ThreadingHTTPServer):
+    # O padrão do socketserver é uma fila de 5 conexões esperando o accept: uma
+    # rajada de 64 clientes ao mesmo tempo (medido) já tomava "connection reset".
+    request_queue_size = 128
+    daemon_threads = True
+
+
 def abrir(host, porta):
-    srv = ThreadingHTTPServer((host, porta), Handler)
-    srv.daemon_threads = True
+    srv = Servidor((host, porta), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
 
@@ -1541,6 +2072,8 @@ RETENTAR_S = 15
 
 def main(argv=None, parar=None):
     cfg = flags(argv)
+    if cfg.exportar:
+        return exportar(cfg)
     cfg.paralelas = max(1, cfg.paralelas)
     enderecos = enderecos_de(cfg.addr)
     if not enderecos:
@@ -1580,6 +2113,8 @@ def main(argv=None, parar=None):
     log(f"     modelo={cfg.modelo or '(padrão)'} esforco={cfg.esforco or '(padrão)'} "
         f"paralelas={cfg.paralelas} "
         f"timeout={cfg.timeout}s ferramentas={cfg.ferramentas or 'nenhuma'} permissao={cfg.permissao}")
+    log(f"     ollama={cfg.ollama} ({ponte.versao_ollama()})  "
+        f"histórico={'desligado' if ponte.memoria is None else cfg.db}")
 
     # SIGTERM (systemd, kill, `iniciar.sh parar`) encerra igual ao Ctrl+C: sem
     # isto o diretório temporário dos `claude` ficaria para trás.

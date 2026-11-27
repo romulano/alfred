@@ -18,10 +18,18 @@ import time
 import unittest
 import urllib.error
 import urllib.request
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import alfred  # noqa: E402
+
+# Nenhum teste toca no histórico de verdade (~/.local/share/alfred) nem no
+# Ollama desta máquina: o banco vai para uma pasta temporária e o Ollama padrão
+# é uma porta onde ninguém escuta.
+_TMP_DB = tempfile.mkdtemp(prefix="teste-alfred-db-")
+os.environ["ALFRED_DB"] = os.path.join(_TMP_DB, "alfred.db")
+os.environ["ALFRED_OLLAMA"] = "http://127.0.0.1:9"
+os.environ.pop("ALFRED_HISTORICO", None)
 
 FALSO = r'''#!/usr/bin/env python3
 import json, os, stat, sys, time
@@ -145,7 +153,8 @@ class Base(unittest.TestCase):
         self.log_codex = os.path.join(d, "chamada-codex.json")
         os.environ["FALSO_LOG_CODEX"] = self.log_codex
 
-        cfg = alfred.flags(["--claude", falso, "--codex", codex, *extra])
+        self.db = os.path.join(d, "alfred.db")
+        cfg = alfred.flags(["--claude", falso, "--codex", codex, "--db", self.db, *extra])
         self.ponte = alfred.Ponte(cfg)
         alfred.Handler.ponte, alfred.Handler.cfg = self.ponte, cfg
         srv = ThreadingHTTPServer(("127.0.0.1", 0), alfred.Handler)
@@ -239,7 +248,7 @@ class ContratoV1(Base):
         self.post("/v1/chat/completions", {"messages": [{"role": "user", "content": "oi"}],
                                            "disallowed_tools": ["Bash", "Write"]})
         argv = self.chamada()["argv"]
-        self.assertEqual(argv[-2:], ["--disallowed-tools", "Bash,Write"])
+        self.assertEqual(argv[-4:], ["--tools", "Read,Grep", "--disallowed-tools", "Bash,Write"])
 
     def test_tools_por_chamada_so_libera_a_pesquisa_na_web(self):
         """Um cliente liga a pesquisa na análise de um artigo; o texto do artigo é de
@@ -931,6 +940,329 @@ class Codex(Base):
         self.assertEqual(alfred.modelo_codex("codex:--json"), "")
         for m in ("opus", "sonnet", "claude-opus-5-5", "fable", "", "claude-code"):
             self.assertEqual(alfred.modelo_codex(m), "", m)
+
+
+class Seguranca(Base):
+    """Um pedido HTTP nunca liga ferramenta nem afrouxa permissão. Antes,
+    `disallowed_tools` trocava a lista de liberadas pela de proibidas — e o
+    CLI, sem `--tools`, ligava todas: Bash, Read, Write."""
+
+    def test_disallowed_tools_nao_liga_as_outras(self):
+        self.sobe()
+        self.post("/v1/chat/completions", {"messages": [{"role": "user", "content": "oi"}],
+                                           "disallowed_tools": ["Bash"]})
+        argv = self.chamada()["argv"]
+        self.assertEqual(argv[-4:], ["--tools", "", "--disallowed-tools", "Bash"])
+        self.post("/run", {"prompt": "oi", "disallowed_tools": "Write"})
+        self.assertEqual(self.chamada()["argv"][-4:], ["--tools", "", "--disallowed-tools", "Write"])
+
+    def test_proibida_sai_da_lista_liberada(self):
+        self.sobe("--ferramentas", "Read,Grep")
+        self.post("/v1/chat/completions", {"messages": [{"role": "user", "content": "oi"}],
+                                           "disallowed_tools": ["Grep"]})
+        self.assertEqual(self.chamada()["argv"][-4:], ["--tools", "Read", "--disallowed-tools", "Grep"])
+
+    def test_permissao_perigosa_no_pedido_e_recusada_sem_abrir_processo(self):
+        self.sobe()
+        for rota, corpo in (("/v1/chat/completions", {"messages": [{"role": "user", "content": "oi"}]}),
+                            ("/run", {"prompt": "oi"})):
+            for modo in ("bypassPermissions", "acceptEdits", "auto"):
+                codigo, doc = self.post(rota, {**corpo, "permission_mode": modo,
+                                               "disallowed_tools": ["X"]})
+                self.assertEqual(codigo, 400, (rota, modo, doc))
+        self.assertFalse(os.path.exists(self.log), "o claude não podia ter sido chamado")
+
+    def test_permissao_permitida_passa_e_o_operador_continua_mandando(self):
+        self.sobe()
+        self.post("/v1/chat/completions", {"messages": [{"role": "user", "content": "oi"}],
+                                           "permission_mode": "default"})
+        argv = self.chamada()["argv"]
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "default")
+        # o operador pode ligar o que quiser, por flag
+        self.sobe("--permissao", "acceptEdits")
+        self.post("/v1/chat/completions", {"messages": [{"role": "user", "content": "oi"}]})
+        argv = self.chamada()["argv"]
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "acceptEdits")
+
+    def test_token_errado_de_outro_tamanho(self):
+        self.sobe("--token", "segredo")
+        codigo, _ = self.post("/run", {"prompt": "oi"}, {"Authorization": "Bearer s"})
+        self.assertEqual(codigo, 401)
+
+
+class FalsoOllama(BaseHTTPRequestHandler):
+    """O /api/chat do Ollama, sem modelo nenhum: registra o pedido e responde."""
+    pedidos = []
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def responder(self, codigo, doc):
+        corpo = json.dumps(doc).encode()
+        try:
+            self.send_response(codigo)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(corpo)))
+            self.end_headers()
+            self.wfile.write(corpo)
+        except OSError:
+            pass
+
+    def do_GET(self):
+        if self.path == "/api/version":
+            self.responder(200, {"version": "0.0-falso"})
+        elif self.path == "/api/tags":
+            self.responder(200, {"models": [{"name": "llama-falso:1b"}, {"name": "qwen-falso:7b"}]})
+        else:
+            self.responder(404, {"error": "não existe"})
+
+    def do_POST(self):
+        pedido = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        FalsoOllama.pedidos.append(pedido)
+        modelo = pedido["model"]
+        if modelo == "sumido":
+            self.responder(404, {"error": f"model '{modelo}' not found"})
+            return
+        if modelo == "lento":
+            time.sleep(30)
+        ultimo = pedido["messages"][-1]
+        self.responder(200, {"model": modelo, "done": True,
+                             "message": {"role": "assistant",
+                                         "content": f"OLLAMA {modelo} IMAGENS={len(ultimo.get('images') or [])}: "
+                                                    + ultimo["content"][:60]},
+                             "prompt_eval_count": 11, "eval_count": 4})
+
+
+class Ollama(Base):
+    def sobe_ollama(self, *extra):
+        FalsoOllama.pedidos = []
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), FalsoOllama)
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        return self.sobe("--ollama", f"http://127.0.0.1:{srv.server_address[1]}", *extra)
+
+    def test_ollama_responde_direto_sem_abrir_processo(self):
+        self.sobe_ollama()
+        codigo, doc = self.post("/v1/chat/completions", {"model": "ollama:llama-falso:1b", "messages": [
+            {"role": "system", "content": "seja breve"}, {"role": "user", "content": "oi"}]})
+        self.assertEqual(codigo, 200, doc)
+        self.assertEqual(doc["choices"][0]["message"]["content"], "OLLAMA llama-falso:1b IMAGENS=0: oi")
+        self.assertEqual(doc["usage"], {"prompt_tokens": 11, "completion_tokens": 4, "total_tokens": 15})
+        self.assertEqual(doc["alfred"]["provedor"], "ollama")
+        p = FalsoOllama.pedidos[-1]
+        self.assertEqual(p["messages"][0], {"role": "system", "content": "seja breve"})
+        self.assertFalse(p["stream"])
+        self.assertFalse(os.path.exists(self.log), "o claude não podia ter sido chamado")
+
+    def test_run_e_esforco_do_servidor_nao_atrapalham(self):
+        self.sobe_ollama("-e", "high")
+        codigo, doc = self.post("/run", {"model": "ollama:qwen-falso:7b", "prompt": "diga x"})
+        self.assertEqual(codigo, 200, doc)
+        self.assertTrue(doc["ok"], doc)
+        self.assertIn("OLLAMA qwen-falso:7b", doc["result"])
+
+    def test_foto_vai_em_images(self):
+        self.sobe_ollama()
+        codigo, doc = self.post("/v1/chat/completions", {"model": "ollama:llama-falso:1b", "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "que é isso?"},
+                                         {"type": "image_url", "image_url": {"url": "data:image/png;base64," + PNG}}]}]})
+        self.assertEqual(codigo, 200, doc)
+        self.assertIn("IMAGENS=1", doc["choices"][0]["message"]["content"])
+        self.assertEqual(FalsoOllama.pedidos[-1]["messages"][-1]["images"], [PNG])
+
+    def test_modelo_que_nao_existe_vira_erro_legivel(self):
+        self.sobe_ollama()
+        codigo, doc = self.post("/v1/chat/completions", {"model": "ollama:sumido",
+                                                         "messages": [{"role": "user", "content": "oi"}]})
+        self.assertEqual(codigo, 502)
+        self.assertIn("not found", doc["error"]["message"])
+
+    def test_nome_invalido_nao_sai_daqui(self):
+        self.sobe_ollama()
+        codigo, doc = self.post("/v1/chat/completions", {"model": "ollama:--x",
+                                                         "messages": [{"role": "user", "content": "oi"}]})
+        self.assertEqual(codigo, 502)
+        self.assertIn("inválido", doc["error"]["message"])
+        self.assertEqual(FalsoOllama.pedidos, [])
+
+    def test_ollama_fora_do_ar(self):
+        self.sobe()  # --ollama padrão dos testes: porta 9, ninguém escuta
+        codigo, doc = self.post("/v1/chat/completions", {"model": "ollama:x",
+                                                         "messages": [{"role": "user", "content": "oi"}]})
+        self.assertEqual(codigo, 502)
+        self.assertIn("não responde", doc["error"]["message"])
+
+    def test_prazo_encerra_a_geracao(self):
+        self.sobe_ollama()
+        t0 = time.time()
+        codigo, doc = self.post("/v1/chat/completions", {"model": "ollama:lento", "timeout_seconds": 7,
+                                                         "messages": [{"role": "user", "content": "oi"}]})
+        self.assertEqual(codigo, 502)
+        self.assertIn("passou de", doc["error"]["message"])
+        self.assertLess(time.time() - t0, 15)
+
+    def test_models_e_healthz_mostram_o_ollama(self):
+        self.sobe_ollama()
+        _, doc = self.get("/v1/models")
+        ids = [m["id"] for m in doc["data"]]
+        self.assertIn("ollama:llama-falso:1b", ids)
+        _, saude = self.get("/healthz")
+        self.assertEqual(saude["ollama"], "0.0-falso")
+
+    def test_modelo_ollama(self):
+        self.assertEqual(alfred.modelo_ollama("ollama:qwen3-coder:30b"), "qwen3-coder:30b")
+        self.assertEqual(alfred.modelo_ollama("Ollama: hf.co/x/y "), "hf.co/x/y")
+        self.assertEqual(alfred.modelo_ollama("ollama:-rf"), "")
+        self.assertEqual(alfred.modelo_ollama("opus"), "")
+
+
+class Historico(Base):
+    """Tudo o que o alfred fez fica no SQLite do dono; conversa com
+    `conversa_id` é lembrada na pergunta seguinte."""
+
+    def ler(self, rota, origem=None, cabecalhos=None):
+        import http.client
+        porta = int(self.base.rsplit(":", 1)[1])
+        conn = http.client.HTTPConnection("127.0.0.1", porta, timeout=30,
+                                          source_address=(origem, 0) if origem else None)
+        conn.request("GET", rota, headers=cabecalhos or {})
+        r = conn.getresponse()
+        doc = json.loads(r.read())
+        conn.close()
+        return r.status, doc
+
+    def test_toda_chamada_fica_no_banco_e_o_banco_e_do_dono(self):
+        self.sobe()
+        _, doc = self.post("/v1/chat/completions", {"model": "sonnet", "messages": [
+            {"role": "system", "content": "sis"}, {"role": "user", "content": "pergunta um"}]})
+        codigo, h = self.get("/v1/historico")
+        self.assertEqual(codigo, 200)
+        self.assertEqual(len(h["data"]), 1)
+        c = h["data"][0]
+        self.assertEqual(c["id"], doc["alfred"]["chamada_id"])
+        self.assertTrue(c["ok"])
+        self.assertEqual((c["provedor"], c["modelo"], c["sistema"]), ("claude", "sonnet", "sis"))
+        self.assertIn("pergunta um", c["entrada"])
+        self.assertTrue(c["resposta"].startswith("RESPOSTA:"))
+        self.assertEqual(c["custo_usd"], 0.0042)
+        self.assertEqual(stat.S_IMODE(os.stat(self.db).st_mode), 0o600)
+
+    def test_conversa_e_lembrada_na_pergunta_seguinte(self):
+        self.sobe()
+        _, a = self.post("/v1/chat/completions", {"conversa_id": "nova", "messages": [
+            {"role": "user", "content": "meu nome é Ana"}]})
+        cid = a["alfred"]["conversa_id"]
+        self.assertTrue(cid)
+        _, b = self.post("/v1/chat/completions", {"conversa_id": cid, "messages": [
+            {"role": "user", "content": "qual é o meu nome?"}]})
+        self.assertEqual(b["alfred"]["conversa_id"], cid)
+        entrada = self.chamada()["stdin"]
+        self.assertIn("[user]\nmeu nome é Ana", entrada)
+        self.assertIn("[assistant]\nRESPOSTA: meu nome é Ana", entrada)
+        self.assertTrue(entrada.endswith("[user]\nqual é o meu nome?"), entrada)
+        _, conversa = self.get(f"/v1/conversas/{cid}")
+        self.assertEqual([m["papel"] for m in conversa["mensagens"]], ["user", "assistant", "user", "assistant"])
+        self.assertEqual(conversa["titulo"], "meu nome é Ana")
+        _, lista_ = self.get("/v1/conversas")
+        self.assertEqual(lista_["data"][0]["mensagens"], 4)
+
+    def test_run_tambem_conversa(self):
+        self.sobe()
+        self.post("/run", {"conversa_id": "c1", "prompt": "primeira"})
+        _, doc = self.post("/run", {"conversa_id": "c1", "prompt": "segunda"})
+        self.assertEqual(doc["conversa_id"], "c1")
+        self.assertIn("[user]\nprimeira", self.chamada()["stdin"])
+
+    def test_falha_fica_no_historico_mas_nao_na_conversa(self):
+        self.sobe(modo="erro")
+        self.post("/v1/chat/completions", {"conversa_id": "c2", "messages": [{"role": "user", "content": "oi"}]})
+        codigo, _ = self.get("/v1/conversas/c2")
+        self.assertEqual(codigo, 404)
+        _, h = self.get("/v1/historico")
+        self.assertFalse(h["data"][0]["ok"])
+        self.assertIn("credit balance", h["data"][0]["erro"])
+
+    def test_historico_false_nao_grava(self):
+        self.sobe()
+        self.post("/v1/chat/completions", {"historico": False, "messages": [{"role": "user", "content": "oi"}]})
+        _, h = self.get("/v1/historico")
+        self.assertEqual(h["data"], [])
+
+    def test_foto_nao_vai_para_o_banco(self):
+        self.sobe()
+        self.post("/v1/chat/completions", {"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "que é isso?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + PNG}}]}]})
+        _, tudo = self.get("/v1/exportar")
+        bruto = json.dumps(tudo, ensure_ascii=False)
+        self.assertNotIn(PNG, bruto)
+        self.assertIn("que é isso?", bruto)
+        self.assertEqual(tudo["chamadas"][0]["midia"]["imagens"], 1)
+
+    def test_apagar_conversa_leva_as_chamadas_dela(self):
+        self.sobe()
+        self.post("/v1/chat/completions", {"conversa_id": "c3", "messages": [{"role": "user", "content": "oi"}]})
+        req = urllib.request.Request(self.base + "/v1/conversas/c3", method="DELETE")
+        with urllib.request.urlopen(req, timeout=30) as r:
+            self.assertTrue(json.loads(r.read())["apagada"])
+        self.assertEqual(self.get("/v1/conversas/c3")[0], 404)
+        self.assertEqual(self.get("/v1/historico")[1]["data"], [])
+
+    def test_historico_so_abre_desta_maquina_sem_token(self):
+        self.sobe()
+        self.assertEqual(self.ler("/v1/historico")[0], 200)
+        # 127.0.0.2 é loopback, mas não é 127.0.0.1: faz o papel de "outra máquina"
+        codigo, doc = self.ler("/v1/exportar", origem="127.0.0.2")
+        self.assertEqual(codigo, 403, doc)
+        self.sobe("--token", "t0k")
+        self.assertEqual(self.ler("/v1/historico")[0], 401)
+        self.assertEqual(self.ler("/v1/historico", origem="127.0.0.2",
+                                  cabecalhos={"Authorization": "Bearer t0k"})[0], 200)
+
+    def test_sem_historico_recusa_conversa_e_nao_cria_banco(self):
+        self.sobe("--sem-historico")
+        codigo, _ = self.post("/v1/chat/completions", {"conversa_id": "x",
+                                                       "messages": [{"role": "user", "content": "oi"}]})
+        self.assertEqual(codigo, 400)
+        codigo, _ = self.post("/v1/chat/completions", {"messages": [{"role": "user", "content": "oi"}]})
+        self.assertEqual(codigo, 200)
+        self.assertFalse(os.path.exists(self.db))
+
+    def test_conversa_id_invalido(self):
+        self.sobe()
+        codigo, _ = self.post("/v1/chat/completions", {"conversa_id": "../etc",
+                                                       "messages": [{"role": "user", "content": "oi"}]})
+        self.assertEqual(codigo, 400)
+
+    def test_ticket_tambem_grava(self):
+        self.sobe("--timeout", "1", espera=3)
+        codigo, t = self.post("/v1/chat/completions", {"agendar": True,
+                                                       "messages": [{"role": "user", "content": "longa"}]})
+        self.assertEqual(codigo, 202, t)
+        for _ in range(100):
+            if self.get(f"/jobs/{t['id']}")[0] == 200:
+                break
+            time.sleep(0.1)
+        _, h = self.get("/v1/historico")
+        self.assertEqual(len(h["data"]), 1)
+        self.assertEqual(h["data"][0]["id"], t["id"])
+        self.assertTrue(h["data"][0]["ticket"])
+        self.assertIn("longa", h["data"][0]["entrada"])
+
+    def test_exportar_pela_linha_de_comando(self):
+        self.sobe()
+        self.post("/v1/chat/completions", {"conversa_id": "c4", "messages": [{"role": "user", "content": "oi"}]})
+        saida = os.path.join(os.path.dirname(self.db), "export.json")
+        self.assertEqual(alfred.main(["--db", self.db, "--exportar", saida]), 0)
+        self.assertEqual(stat.S_IMODE(os.stat(saida).st_mode), 0o600)
+        with open(saida) as f:
+            doc = json.load(f)
+        self.assertEqual(doc["formato"], "alfred-historico")
+        self.assertEqual(doc["conversas"][0]["id"], "c4")
+        self.assertEqual(len(doc["conversas"][0]["mensagens"]), 2)
+        self.assertEqual(len(doc["chamadas"]), 1)
 
 
 if __name__ == "__main__":

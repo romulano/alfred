@@ -1,33 +1,189 @@
-# alfred — ponte HTTP para o Claude Code da máquina
+<p align="center">
+  <img src="docs/logo.svg" alt="alfred" width="160">
+</p>
 
-> Roda sozinho, sem Docker, e serve qualquer programa que fale HTTP no formato
-> da OpenAI, como o app **Treino IA** (`~/job/exercicio`) e o cve-php.
-> Escuta em **vários endereços** ao mesmo tempo
-> (`--addr a,b`), espera sozinha por um endereço que ainda não existe (a rede
-> Docker do Treino IA só nasce quando o app sobe), encerra limpo com SIGTERM, e
-> vem com `iniciar.sh` + `alfred.conf`.
+<h1 align="center">alfred</h1>
 
-## Rodar sozinho
+<p align="center">
+  <b>O mordomo das suas IAs.</b><br>
+  Uma API local, no formato da OpenAI, que serve o Claude Code, o Codex e o Ollama da sua máquina —
+  e lembra de tudo o que fez, num histórico que é só seu.
+</p>
 
-```bash
-cd ~/job/alfred
-./iniciar.sh fundo     # em segundo plano (log em alfred.log)
-./iniciar.sh status    # no ar? modelo? chamadas e custo acumulado
-./iniciar.sh parar
-./iniciar.sh           # no terminal, Ctrl+C para sair
+---
+
+## O que é
+
+Os CLIs de IA (`claude`, `codex`) são programas de terminal: leem o prompt no
+stdin e escrevem a resposta no stdout. Muita coisa útil, porém, só sabe falar
+HTTP. O **alfred** é a ponte: um servidor local que recebe um
+`POST /v1/chat/completions` (o formato da OpenAI), entrega o pedido à IA certa e
+devolve a resposta no formato que o cliente espera.
+
+```
+seu programa ──POST /v1/chat/completions──▶ alfred ──┬─ claude -p ─────▶ Claude Code
+             ◀── choices.0.message.content ──        ├─ codex exec ────▶ Codex (GPT)
+                                                     └─ HTTP /api/chat ▶ Ollama (local)
+                                                            │
+                                                            ▼
+                                             ~/.local/share/alfred/alfred.db
+                                               (histórico e conversas, 0600)
 ```
 
-Na primeira vez o `iniciar.sh` cria o `alfred.conf` (permissão 600, fora do git)
-a partir do `alfred.conf.exemplo`. É nele que se escolhe:
+- **Usa o login que já está na máquina**: sem chave de API, sem conta nova.
+- **Três provedores, uma API**: o campo `model` decide quem responde
+  (`sonnet`, `GPT-6.2-Sol`, `ollama:qwen3-coder:30b`…).
+- **Memória local**: toda pergunta e resposta fica num SQLite do dono, com
+  conversas que continuam de onde pararam. Nada sai da máquina; exportar é um comando.
+- **Seguro por padrão**: a IA responde **sem ferramenta nenhuma** (não lê disco,
+  não roda comando), o prompt nunca passa por argv, e nenhum pedido HTTP consegue
+  afrouxar isso.
+- **Fotos e vídeos**, **tickets** para trabalhos longos, **cancelamento** quando o
+  cliente desiste, e custo/tokens de cada chamada.
+- **Python 3 puro**, só biblioteca padrão: nada para compilar, nada para `pip install`.
 
-| variável | o quê |
+## Instalação, passo a passo
+
+### 1. Pré-requisitos
+
+| o quê | para quê | obrigatório? |
+|---|---|---|
+| Linux ou macOS com **Python 3.10+** | rodar o alfred | sim |
+| **Claude Code** (`claude`) com login feito | modelos `opus`, `sonnet`, `haiku`, `fable` | ao menos um provedor |
+| **Codex** (`codex`) com login feito | modelos `GPT-…` | opcional |
+| **Ollama** rodando, com algum modelo baixado | modelos `ollama:<nome>`, 100% locais | opcional |
+| **ffmpeg** | vídeo e fotos grandes ou em HEIC | opcional |
+| `curl` | o `./iniciar.sh status` e os exemplos | recomendado |
+
+Confira o que já existe:
+
+```bash
+python3 --version
+claude --version    # Claude Code
+codex --version     # Codex (opcional)
+ollama list         # Ollama (opcional)
+ffmpeg -version     # ffmpeg (opcional)
+```
+
+### 2. Prepare os provedores que for usar
+
+```bash
+# Claude Code: instale e faça login uma vez (abre o navegador)
+claude          # siga o login e saia com /exit
+
+# Codex (opcional)
+codex login
+
+# Ollama (opcional): suba o serviço e baixe um modelo
+ollama serve &              # se ele ainda não roda como serviço
+ollama pull qwen3-coder:30b # ou qualquer outro do `ollama list`
+```
+
+O alfred usa esses logins como estão — ele não guarda nem vê senha ou token de
+nenhum provedor.
+
+### 3. Baixe o alfred
+
+```bash
+git clone https://github.com/romulano/alfred.git
+cd alfred
+```
+
+### 4. Configure
+
+```bash
+./iniciar.sh status   # na primeira vez cria o alfred.conf (0600, fora do git) e diz que está fora do ar
+$EDITOR alfred.conf
+```
+
+O mínimo é escolher o modelo padrão e onde escutar. Para uso só nesta máquina:
+
+```ini
+ALFRED_MODELO=sonnet
+ALFRED_ADDR=127.0.0.1:8765
+```
+
+Todas as opções estão em [Configuração](#configuração).
+
+### 5. Suba e teste
+
+```bash
+./iniciar.sh fundo    # em segundo plano, log em alfred.log
+./iniciar.sh status   # no ar? quais provedores? quanto já gastou?
+
+curl -s localhost:8765/v1/chat/completions \
+  -d '{"messages":[{"role":"user","content":"Diga olá em uma palavra."}]}'
+```
+
+A resposta vem em `choices[0].message.content`. Para parar: `./iniciar.sh parar`.
+Para rodar no terminal, com o log na tela: `./iniciar.sh` (Ctrl+C sai).
+
+### 6. Aponte seus programas para ele
+
+Qualquer cliente compatível com a OpenAI funciona trocando a URL base para
+`http://127.0.0.1:8765/v1`. A chave de API pode ser qualquer texto — ou o
+`ALFRED_TOKEN`, se você configurar um.
+
+```python
+from openai import OpenAI
+ia = OpenAI(base_url="http://127.0.0.1:8765/v1", api_key="alfred")
+r = ia.chat.completions.create(model="sonnet", messages=[{"role": "user", "content": "oi"}])
+print(r.choices[0].message.content)
+```
+
+## Configuração
+
+Tudo fica no `alfred.conf` (criado a partir do [`alfred.conf.exemplo`](alfred.conf.exemplo)).
+Qualquer variável do ambiente vence o arquivo (`ALFRED_MODELO=opus ./iniciar.sh`), e
+argumentos extras vão direto ao `alfred.py` (`./iniciar.sh -e high`).
+
+| variável | padrão | o quê |
+|---|---|---|
+| `ALFRED_MODELO` | padrão do CLI | modelo de quem não pede um: `opus`, `sonnet`, `haiku`, `fable`, nome completo (`claude-opus-5-5`…), um GPT (`GPT-6.2-Sol`) ou `ollama:<nome>`. O cliente pode pedir outro por chamada no campo `model`. |
+| `ALFRED_ESFORCO` | padrão do CLI | quanto o modelo pensa: `low`, `medium`, `high`, `xhigh`, `max` (e `ultra`, só no Codex). O cliente pode pedir por chamada (`reasoning_effort`). O Ollama ignora. |
+| `ALFRED_ADDR` | `127.0.0.1:8765` | onde escutar; vários endereços separados por vírgula. Um endereço que ainda não existe (a rede de um Docker que não subiu) é tentado de novo a cada 15 s. |
+| `ALFRED_TOKEN` | vazio | com valor, todo POST e a leitura do histórico pedem `Authorization: Bearer <token>`. **Configure sempre que escutar fora do 127.0.0.1.** |
+| `ALFRED_PARALELAS` | `2` | quantas chamadas rodam ao mesmo tempo; as outras esperam na fila. |
+| `ALFRED_CLAUDE` | `claude` do PATH | caminho do CLI do Claude Code. |
+| `ALFRED_CODEX` | `codex` do PATH | caminho do CLI do Codex. |
+| `ALFRED_OLLAMA` | `http://127.0.0.1:11434` | endereço da API do Ollama. |
+| `ALFRED_DB` | `~/.local/share/alfred/alfred.db` | o SQLite do histórico. |
+| `ALFRED_HISTORICO` | `1` | `0` desliga o histórico: nada é gravado e `conversa_id` é recusado. |
+| `ALFRED_FFMPEG` | `ffmpeg` do PATH | caminho do ffmpeg. |
+| `ALFRED_QUADROS_VIDEO` | `8` | quantos quadros tirar de cada vídeo. |
+| `ALFRED_MAX_CORPO_MB` | `64` | teto de um pedido, contando fotos e vídeos em base64. |
+| `ALFRED_JOB_TETO` | `1800` | quanto um trabalho que virou ticket pode rodar, em segundos. |
+
+Os comandos do dia a dia:
+
+```bash
+./iniciar.sh                          # no terminal (Ctrl+C sai)
+./iniciar.sh fundo                    # em segundo plano, log em alfred.log
+./iniciar.sh status                   # estado, provedores, chamadas e custo
+./iniciar.sh parar                    # encerra (espera soltar as portas)
+./iniciar.sh exportar historico.json  # o histórico inteiro em JSON (0600)
+```
+
+## Escolhendo a IA
+
+O provedor sai do campo `model`, por chamada:
+
+| `model` | vai para |
 |---|---|
-| `ALFRED_MODELO` | modelo padrão: `opus`, `sonnet`, `haiku` ou nome completo (`claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`, `claude-fable-5-1`) vão ao Claude Code; `gpt-6.2-sol`, `GPT-6.2-Astra`… vão ao **Codex** (ver abaixo). O cliente pode pedir outro por chamada no campo `model`. |
-| `ALFRED_CODEX` | caminho do CLI do Codex; vazio = `codex` do PATH ou `~/.codex/packages/app-server-daemon/current/codex`. |
-| `ALFRED_ESFORCO` | `low` … `max`; vazio = o do CLI. O cliente pode pedir por chamada (`reasoning_effort`). |
-| `ALFRED_ADDR` | endereços separados por vírgula. Padrão: `127.0.0.1:8765` (analista) e `172.31.87.1:8765` (rede Docker do Treino IA — fora da rede Wi‑Fi). |
-| `ALFRED_TOKEN` | com valor, todo POST precisa de `Authorization: Bearer <token>`. O analista não manda token: se ele for usar esta cópia, adicione o cabeçalho no `analista.json` (`"Authorization": "Bearer {{env:ALFRED_TOKEN}}"`). |
-| `ALFRED_PARALELAS` | quantos `claude` ao mesmo tempo. |
+| `opus`, `sonnet`, `haiku`, `fable`, `claude-…`, `claude-code` ou vazio | Claude Code (`claude -p`) |
+| `GPT-6.2-Sol`, `gpt-6.1-terra`, `GPT-6 Luna`… (qualquer caixa), `codex:<slug>`, `openai:<slug>` | Codex (`codex exec`) |
+| `ollama:<nome>`, ex. `ollama:qwen3-coder:30b` | Ollama, direto pela API HTTP |
+
+`GET /v1/models` lista tudo o que esta máquina tem disponível.
+
+### Ollama
+
+`model: "ollama:<nome>"` (o nome como o `ollama list` mostra: `ollama:qwen3-coder:30b`,
+`ollama:dolphin-mistral`) vai direto ao `/api/chat` do Ollama, por HTTP — sem
+processo para abrir. Prompt de sistema, fotos (campo `images`), prazo, ticket e
+cancelamento valem igual; fechar a conexão faz o Ollama parar de gerar. Ferramentas
+e esforço não existem lá e são ignorados. Custo sai 0; os tokens vêm no `usage`.
+Os modelos instalados aparecem no `GET /v1/models` com o prefixo `ollama:`.
 
 ### Codex (modelos GPT)
 
@@ -83,18 +239,65 @@ cada um com o instante; foto acima de ~3,5 MB ou em formato que o Claude não l�
 (HEIC, BMP…) é convertida em JPEG. As duas coisas usam o `ffmpeg`. O `/healthz`
 diz o que a ponte aceita em `midia`.
 
-Esta cópia também aceita `DELETE /jobs/<id>` (com o token, se houver): cancela o
-ticket e encerra o `claude` que estava trabalhando nele. `./iniciar.sh parar`
-espera o processo soltar as portas antes de voltar.
+## Histórico e conversas
 
-Qualquer variável do ambiente vence o arquivo: `ALFRED_MODELO=opus ./iniciar.sh`.
-Argumentos extras vão direto ao `alfred.py`: `./iniciar.sh -e high`.
+Toda pergunta fica num SQLite **local, só do dono** (arquivo `0600`, pasta `0700`):
+rota, quem pediu, provedor, modelo, prompt de sistema, o que entrou (foto e vídeo
+viram só a marca `{"type": …, "omitido": true}`), resposta ou erro, custo, tokens,
+duração. Nada sai da máquina. `"historico": false` no pedido não grava aquela chamada.
 
-Testes (com um `claude` falso, sem gastar IA): `python3 teste_alfred.py`.
+**Conversa:** mande `"conversa_id"` (um id seu, ou `"nova"` para o alfred inventar
+um — ele volta em `alfred.conversa_id`) e **só a mensagem nova**. O alfred põe na
+frente o que já foi dito, e grava pergunta e resposta quando a chamada dá certo
+(falha não entra na conversa). Vale no `/run` também.
 
-## Documentação original
+```bash
+curl -s localhost:8765/v1/chat/completions -d '{"conversa_id":"nova","messages":[{"role":"user","content":"meu número é 47"}]}'
+curl -s localhost:8765/v1/chat/completions -d '{"conversa_id":"<id>","messages":[{"role":"user","content":"qual é o meu número?"}]}'
+```
 
-### alfred — a ponte entre o analista e o CLI do Claude Code
+| rota | o quê |
+|---|---|
+| `GET /v1/conversas` | as conversas, da mais recente (`?limite=`) |
+| `GET /v1/conversas/<id>` | uma conversa com as mensagens |
+| `DELETE /v1/conversas/<id>` | apaga a conversa e as chamadas dela |
+| `GET /v1/historico` | as últimas chamadas (`?limite=`, `?conversa=<id>`) |
+| `GET /v1/exportar` | tudo, num JSON só |
+
+Essas rotas só abrem **a partir desta máquina** (127.0.0.1) quando não há token;
+com `ALFRED_TOKEN`, pedem o token. Para levar o histórico embora:
+`./iniciar.sh exportar historico.json` (o arquivo sai `0600`).
+
+## Segurança: o que um pedido não consegue
+
+Um pedido HTTP não liga ferramenta nem afrouxa permissão. `permission_mode` aceita
+só `plan` e `default` (os outros, como `bypassPermissions`, só o operador liga,
+por `--permissao`); `disallowed_tools` só **tira** ferramentas da lista liberada;
+`tools` só liga `WebSearch` e `WebFetch`.
+
+`DELETE /jobs/<id>` (com o token, se houver) cancela um ticket e encerra a IA que
+estava trabalhando nele.
+
+**A porta é uma chave de execução.** Quem consegue fazer POST no alfred usa as
+suas IAs com a sua conta pagando. Fique no `127.0.0.1`; se precisar escutar em
+outro endereço (uma rede Docker, a rede local), configure o `ALFRED_TOKEN`.
+
+## Testes
+
+```bash
+python3 teste_alfred.py
+```
+
+Nenhum teste gasta IA de verdade: o `claude`, o `codex` e o Ollama dos testes são
+falsos e registram o que receberam (argv, stdin, cwd, permissão dos arquivos), e o
+histórico vai para uma pasta temporária.
+
+## Referência detalhada
+
+O alfred nasceu como a ponte entre o `analista` e o CLI do Claude Code; as
+seções abaixo explicam as decisões de projeto e os detalhes de cada recurso.
+
+### A ponte do analista
 
 O `analista` sabe falar com **qualquer IA que fale HTTP+JSON**: o `analista.json`
 descreve o corpo que sai e o caminho onde ler o texto que volta. O Claude Code
@@ -112,7 +315,7 @@ Sem ele, `ctfmotor -ia` sobe, chama o analista, e o analista morre em
 serve. Por isso **não há nada para configurar**: suba a ponte e o modo IA passa
 a funcionar.
 
-## Uso
+### Uso direto
 
 ```bash
 ./alfred.py                              # 127.0.0.1:8765, sem ferramenta, modo plan
@@ -134,7 +337,7 @@ Python 3 puro, biblioteca padrão, sem build — ele roda onde o `claude` roda, 
 a única peça do `programas/` que não é Go justamente por isso: não vai para
 dentro de nenhum alvo, fica na sua máquina, ao lado do CLI.
 
-## Os dois caminhos
+### Os dois caminhos
 
 O analista traz dois backends de fábrica, e a ponte serve os dois:
 
@@ -152,10 +355,12 @@ campo não é um erro na largada — é o analista dizendo *"campo não existe"*
 meio de uma corrida, com a chamada já paga.
 
 Os campos que o `/run` aceita (`permission_mode`, `max_turns`,
-`timeout_seconds`, `disallowed_tools`) também valem no `/v1`, e vencem as flags
-do servidor.
+`timeout_seconds`, `disallowed_tools`) também valem no `/v1`. `max_turns` e
+`timeout_seconds` vencem as flags do servidor (até o teto); `permission_mode` só
+aceita `plan` e `default`, e `disallowed_tools` só tira ferramentas — nenhum
+pedido liga o que o operador não ligou.
 
-## Três decisões que não são detalhe
+### Três decisões que não são detalhe
 
 **1. O prompt vai pelo stdin, nunca por argv.** Ele carrega a `-ia-instrucao` da
 corrida, e essa instrução costuma trazer a senha da conta de teste — argv é
@@ -168,8 +373,9 @@ pede execução: ele pede julgamento sobre um JSON que já vem no prompt. Um Cla
 Code com Bash ligado, lendo o `CLAUDE.md` do diretório e as configurações do
 usuário, faria trabalho que ninguém pediu e cobraria por ele — a chamada trivial
 medida aqui caiu de **US$ 0,108 para US$ 0,007** só por trocar o prompt de
-sistema embutido pelo do analista. Quem quiser ferramenta pede: `--ferramentas
-Read,Grep` na ponte, ou `disallowed_tools` no corpo.
+sistema embutido pelo do analista. Quem quiser ferramenta liga na ponte
+(`--ferramentas Read,Grep`); um pedido só consegue ligar `WebSearch` e
+`WebFetch` (campo `tools`).
 
 **3. Quando o cliente some, o Claude morre junto.** O motor mata chamadas em voo
 quando o orçamento estoura; um `claude` órfão continuaria pensando — e cobrando
@@ -182,7 +388,7 @@ escreve aviso ali de vez em quando, e repassá-lo faria o analista descartar uma
 resposta que chegou inteira. Isso não apareceria como bug — apareceria como a IA
 falhando sem motivo.
 
-## Modelo e esforço
+### Modelo e esforço
 
 `--modelo` aceita alias (`opus`, `sonnet`, `haiku`, `fable`) ou nome completo, e
 alias entrega **a última versão daquela família**. Para fixar uma versão — a
@@ -210,7 +416,7 @@ Medido aqui, com `-e max` em Fable 5.1: um `analista ping` custou US$ 0,059 e
 corrida com dezenas de chamadas, essa diferença é a conta inteira — vale onde a
 resposta decide o próximo passo, não em tudo.
 
-## Flags
+### Flags
 
 ```
 --addr 127.0.0.1:8765   endereço de escuta
@@ -225,6 +431,10 @@ resposta decide o próximo passo, não em tudo.
 --ferramentas ''        liberadas (ex.: Read,Grep); vazio = nenhuma
 --dir ''                cwd do claude; vazio = um temporário só dele
 --token ''              exige Authorization: Bearer <token>
+--ollama URL            API do Ollama (padrão: http://127.0.0.1:11434)
+--db ARQUIVO            o SQLite do histórico (padrão: ~/.local/share/alfred/alfred.db)
+--sem-historico         não grava nada no histórico
+--exportar ARQUIVO      escreve o histórico em JSON (- = tela) e sai
 -v, --verboso           loga o argv de cada chamada
 ```
 
@@ -237,7 +447,7 @@ subir um Claude Code que só terminaria depois de o cliente ir embora. E se o
 cliente fecha a conexão enquanto a chamada espera vaga, ela é largada ali: nenhum
 processo sobe, nenhum token é pago.
 
-## Agendamento: a pergunta que não cabe numa requisição
+### Agendamento: a pergunta que não cabe numa requisição
 
 A forja pede ao modelo o código **inteiro** de uma ferramenta nova, e o ctfmotor
 reserva 30 minutos para isso (`-forja-teto`). Uma requisição HTTP razoável dura
@@ -277,14 +487,13 @@ Detalhes que importam no consumo:
   ver o README dele. O prazo total é o do ctx de quem chamou (30min na forja),
   nunca um teto inventado no meio do caminho.
 
-Tudo também por ambiente: `ALFRED_ADDR`, `ALFRED_CLAUDE`, `ALFRED_MODELO`,
-`ALFRED_ESFORCO`, `ALFRED_PARALELAS`, `ALFRED_TOKEN`.
+Tudo também por ambiente — ver [Configuração](#configuração).
 
 **A porta é local de propósito.** Quem pode fazer POST aqui manda no seu Claude
 Code, com a sua conta pagando. Se precisar expor (`--addr 0.0.0.0:8765`), use
 `--token` — e saiba que continua sendo uma chave de execução, não de leitura.
 
-## Custo
+### Custo
 
 Cada pergunta do analista é uma chamada paga. Medido nesta máquina, com
 `-m sonnet`: um `analista ping` custou US$ 0,01; um `analista validar` completo,
@@ -294,15 +503,3 @@ US$ 0,07 e 62 segundos. Uma corrida com `-ia` faz dezenas dessas — o
 ```
 [alfred] /v1/chat/completions 61.8s  US$ 0.0722  in=5216 out=1103 turnos=1  ok
 ```
-
-## Testes
-
-```bash
-python3 teste_alfred.py
-```
-
-Os testes não gastam uma chamada de IA: o `claude` e o `codex` deles são scripts falsos
-que registra o argv, o stdin, o cwd e o modo do arquivo de sistema que recebeu.
-É o que permite afirmar que o prompt não passa por argv e que o `stderr` de uma
-resposta boa não vaza — as duas coisas que, sem teste, só se descobririam no
-meio de uma corrida.
